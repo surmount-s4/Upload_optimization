@@ -27,7 +27,8 @@ public class FileProcessor : IDisposable
         {
             if (_fileStream != null)
             {
-                throw new InvalidOperationException("Another file is already locked. Release it first.");
+                // Release previous lock first
+                ReleaseFile();
             }
 
             // FileShare.Read allows others to read but not write/delete
@@ -42,8 +43,10 @@ public class FileProcessor : IDisposable
             _currentFilePath = filePath;
             return true;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            Console.WriteLine($"[FileProcessor] Failed to lock file: {ex.Message}");
+            Console.WriteLine($"[FileProcessor] File path: {filePath}");
             return false;
         }
     }

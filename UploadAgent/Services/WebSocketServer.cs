@@ -18,6 +18,9 @@ public class WebSocketServer : IDisposable
     private HttpListener? _listener;
     private readonly ConcurrentDictionary<string, WebSocket> _clients = new();
     private CancellationTokenSource? _cts;
+    
+    // Semaphore to serialize WebSocket sends (WebSocket only allows one send at a time)
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
 
     // Event handlers for commands
     public event Func<string, string?, Task>? OnStartCommand;
@@ -126,20 +129,24 @@ public class WebSocketServer : IDisposable
         {
             _logger.LogWarning(ex, "WebSocket error for client {ClientId}", clientId);
         }
+        catch (OperationCanceledException)
+        {
+            // Normal shutdown
+        }
         finally
         {
             _clients.TryRemove(clientId, out _);
-            webSocket?.Dispose();
+            try { webSocket?.Dispose(); } catch { }
             _logger.LogInformation("Client {ClientId} disconnected", clientId);
         }
     }
 
-    private async Task HandleCommandAsync(string message)
+    private Task HandleCommandAsync(string message)
     {
         try
         {
             var command = JsonSerializer.Deserialize<WsCommand>(message);
-            if (command == null) return;
+            if (command == null) return Task.CompletedTask;
 
             _logger.LogInformation("Received command: {Action}", command.Action);
 
@@ -148,28 +155,29 @@ public class WebSocketServer : IDisposable
                 case "start":
                     if (!string.IsNullOrEmpty(command.FilePath))
                     {
-                        OnStartCommand?.Invoke(command.FilePath, command.BackendUrl);
+                        // Fire and forget - don't await
+                        _ = Task.Run(() => OnStartCommand?.Invoke(command.FilePath, command.BackendUrl));
                     }
                     break;
 
                 case "pause":
                     if (!string.IsNullOrEmpty(command.UploadId))
                     {
-                        OnPauseCommand?.Invoke(command.UploadId);
+                        _ = Task.Run(() => OnPauseCommand?.Invoke(command.UploadId));
                     }
                     break;
 
                 case "resume":
                     if (!string.IsNullOrEmpty(command.UploadId))
                     {
-                        OnResumeCommand?.Invoke(command.UploadId);
+                        _ = Task.Run(() => OnResumeCommand?.Invoke(command.UploadId));
                     }
                     break;
 
                 case "cancel":
                     if (!string.IsNullOrEmpty(command.UploadId))
                     {
-                        OnCancelCommand?.Invoke(command.UploadId);
+                        _ = Task.Run(() => OnCancelCommand?.Invoke(command.UploadId));
                     }
                     break;
             }
@@ -178,10 +186,12 @@ public class WebSocketServer : IDisposable
         {
             _logger.LogWarning(ex, "Invalid JSON command received");
         }
+        
+        return Task.CompletedTask;
     }
 
     /// <summary>
-    /// Broadcast a message to all connected clients.
+    /// Broadcast a message to all connected clients (thread-safe).
     /// </summary>
     public async Task BroadcastAsync<T>(T message) where T : WsMessage
     {
@@ -189,19 +199,40 @@ public class WebSocketServer : IDisposable
         var bytes = Encoding.UTF8.GetBytes(json);
         var segment = new ArraySegment<byte>(bytes);
 
-        foreach (var (clientId, socket) in _clients)
+        // Serialize sends to avoid concurrent WebSocket access
+        await _sendLock.WaitAsync();
+        try
         {
-            if (socket.State == WebSocketState.Open)
+            var deadClients = new List<string>();
+            
+            foreach (var (clientId, socket) in _clients)
             {
                 try
                 {
-                    await socket.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
+                    if (socket.State == WebSocketState.Open)
+                    {
+                        await socket.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
+                    }
+                    else
+                    {
+                        deadClients.Add(clientId);
+                    }
                 }
-                catch (WebSocketException)
+                catch (Exception)
                 {
-                    _clients.TryRemove(clientId, out _);
+                    deadClients.Add(clientId);
                 }
             }
+            
+            // Clean up dead clients
+            foreach (var clientId in deadClients)
+            {
+                _clients.TryRemove(clientId, out _);
+            }
+        }
+        finally
+        {
+            _sendLock.Release();
         }
     }
 
@@ -212,9 +243,21 @@ public class WebSocketServer : IDisposable
     {
         if (_clients.TryGetValue(clientId, out var socket) && socket.State == WebSocketState.Open)
         {
-            var json = JsonSerializer.Serialize(message);
-            var bytes = Encoding.UTF8.GetBytes(json);
-            await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+            await _sendLock.WaitAsync();
+            try
+            {
+                var json = JsonSerializer.Serialize(message);
+                var bytes = Encoding.UTF8.GetBytes(json);
+                await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+            }
+            catch (Exception)
+            {
+                _clients.TryRemove(clientId, out _);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
         }
     }
 
@@ -249,10 +292,12 @@ public class WebSocketServer : IDisposable
         Stop();
         _cts?.Dispose();
         _listener?.Close();
+        _sendLock.Dispose();
         foreach (var socket in _clients.Values)
         {
-            socket.Dispose();
+            try { socket.Dispose(); } catch { }
         }
         _clients.Clear();
     }
 }
+

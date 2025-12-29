@@ -249,9 +249,12 @@ public class UploadWorkerPool : IDisposable
             try
             {
                 var partList = string.Join(",", batch);
-                var url = $"{backendUrl}/api/upload/presign?upload_id={job.UploadId}&part_numbers={partList}";
+                var url = $"{backendUrl}/api/upload/presign?upload_id={job.UploadId}&bucket={Uri.EscapeDataString(job.Bucket)}&object_key={Uri.EscapeDataString(job.ObjectKey)}&part_numbers={partList}";
+                
+                _logger.LogDebug("Fetching presigned URLs: {Url}", url);
                 
                 var response = await _httpClient.GetAsync(url, cancellationToken);
+                
                 if (response.IsSuccessStatusCode)
                 {
                     var json = await response.Content.ReadAsStringAsync(cancellationToken);
@@ -259,6 +262,9 @@ public class UploadWorkerPool : IDisposable
                     
                     if (result?.Urls != null)
                     {
+                        _logger.LogInformation("Received {Count} presigned URLs for parts: {Parts}", 
+                            result.Urls.Count, partList);
+                        
                         foreach (var urlInfo in result.Urls)
                         {
                             _urlQueue.Enqueue(new PresignedUrlInfo
@@ -269,6 +275,15 @@ public class UploadWorkerPool : IDisposable
                             });
                         }
                     }
+                    else
+                    {
+                        _logger.LogWarning("Presign response had no URLs. JSON: {Json}", json);
+                    }
+                }
+                else
+                {
+                    var errorBody = await response.Content.ReadAsStringAsync(cancellationToken);
+                    _logger.LogError("Presign request failed: {Status} - {Body}", response.StatusCode, errorBody);
                 }
             }
             catch (Exception ex)
@@ -380,13 +395,19 @@ public class UploadWorkerPool : IDisposable
     // Helper classes for JSON deserialization
     private class PresignResponse
     {
+        [System.Text.Json.Serialization.JsonPropertyName("urls")]
         public List<PresignUrlItem>? Urls { get; set; }
     }
 
     private class PresignUrlItem
     {
+        [System.Text.Json.Serialization.JsonPropertyName("part_number")]
         public int PartNumber { get; set; }
+        
+        [System.Text.Json.Serialization.JsonPropertyName("url")]
         public string Url { get; set; } = string.Empty;
+        
+        [System.Text.Json.Serialization.JsonPropertyName("expires_at")]
         public string ExpiresAt { get; set; } = string.Empty;
     }
 }

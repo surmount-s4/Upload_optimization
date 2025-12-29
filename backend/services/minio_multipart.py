@@ -186,7 +186,7 @@ class MinioMultipartService:
         expires = expires or timedelta(hours=self.presign_expiry_hours)
         
         # Generate presigned URL with multipart query params
-        url = self.client.presigned_url(
+        url = self.client.get_presigned_url(
             method="PUT",
             bucket_name=bucket,
             object_name=object_key,
